@@ -37,10 +37,16 @@ Right-click the tray icon:
 
 | option | does |
 |---|---|
-| **Enabled** | master toggle |
-| **Restore window focus** | give focus back to the pre-touch window after a tap |
+| **Enabled** | master toggle (remembered between runs) |
+| **Restore window focus** | give focus back to the pre-touch window after a tap (remembered between runs) |
 | **Run at startup** | auto-start at login (HKCU `Run` key — no admin, no scheduled task) |
 | **Exit** | quit |
+
+Preferences are stored as DWORD values `Enabled` and `RestoreFocus` under
+`HKEY_CURRENT_USER\Software\TouchCursorFix`. Both default to enabled on a fresh
+installation. Turn off **Restore window focus** to keep typing in a text field
+you touched on the touchscreen while still returning the mouse cursor home.
+**Run at startup** remains a separate, opt-in setting.
 
 ## How it works
 

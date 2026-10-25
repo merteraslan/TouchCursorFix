@@ -72,6 +72,7 @@
 
 static const wchar_t* APP_NAME = L"TouchCursorFix";
 static const wchar_t* RUN_KEY  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* SETTINGS_KEY = L"Software\\TouchCursorFix";
 
 static HINSTANCE       g_hInst;
 static HWND            g_hwnd;
@@ -131,6 +132,32 @@ static void LogF(const char* fmt, ...) {
     va_end(ap);
     fputc('\n', g_logf);
     fflush(g_logf);
+}
+
+// Preserve the original defaults when a preference is absent or invalid.
+static BOOL ReadBoolSetting(const wchar_t* name, BOOL fallback) {
+    DWORD value = 0, size = sizeof(value);
+    LSTATUS result = RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name,
+                                  RRF_RT_REG_DWORD, nullptr, &value, &size);
+    return result == ERROR_SUCCESS && value <= 1 ? (BOOL)value : fallback;
+}
+
+static void LoadSettings() {
+    g_enabled      = ReadBoolSetting(L"Enabled", TRUE);
+    g_restoreFocus = ReadBoolSetting(L"RestoreFocus", TRUE);
+}
+
+static void SaveBoolSetting(const wchar_t* name, BOOL enabled) {
+    HKEY key;
+    LSTATUS result = RegCreateKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, nullptr,
+                                    0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (result == ERROR_SUCCESS) {
+        DWORD value = enabled ? 1 : 0;
+        result = RegSetValueExW(key, name, 0, REG_DWORD,
+                               (const BYTE*)&value, sizeof(value));
+        RegCloseKey(key);
+    }
+    if (result != ERROR_SUCCESS) LogF("setting save failed: %ld", result);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,8 +565,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         switch (LOWORD(w)) {
         case IDM_ENABLED: g_enabled = !g_enabled; InterlockedExchange(&g_pending, 0);
                           g_snapUntil = 0; g_guardUntil = 0;
-                          InterlockedExchange(&g_warped, 0); break;
-        case IDM_FOCUS:   g_restoreFocus = !g_restoreFocus; break;
+                          InterlockedExchange(&g_warped, 0);
+                          SaveBoolSetting(L"Enabled", g_enabled); break;
+        case IDM_FOCUS:   g_restoreFocus = !g_restoreFocus;
+                          SaveBoolSetting(L"RestoreFocus", g_restoreFocus); break;
         case IDM_STARTUP: SetStartup(!StartupEnabled()); break;
         case IDM_EXIT:    DestroyWindow(hwnd); break;
         }
@@ -570,6 +599,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
         g_logf = _wfopen(p, L"w");
         LogF("start (v1.3.0)");
     }
+
+    LoadSettings();
 
     // Per-Monitor-V2 DPI awareness: the LL-hook coords and SetCursorPos then share
     // one physical-pixel space on mixed-DPI monitor setups (no-op before Win10 1703).

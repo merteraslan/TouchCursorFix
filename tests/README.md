@@ -21,3 +21,6 @@ running at startup; disabling cancels pending touch state and posted teleports; 
 touch triggers remain inert while disabled; re-enabling seeds fresh tracking.
 Log path cases cover a short executable name whose longer log name crosses
 `MAX_PATH`, truncated module paths, Unicode paths, and module-query failures.
+Touch cases cover a three-monitor edge, touch immediately after mouse motion,
+out-of-order raw-input timestamps, return without a raw digitizer event, genuine
+physical mouse entry, and hotkey/tray recovery without stealing keyboard focus.

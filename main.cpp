@@ -54,6 +54,8 @@
 #define IDM_FOCUS   101
 #define IDM_STARTUP 102
 #define IDM_EXIT    103
+#define IDM_HOME    104
+#define HOTKEY_HOME 1
 #define TIMER_ID     1
 #define TIMER_REHOOK 2
 
@@ -69,7 +71,6 @@
                             // which takes SECONDS for slow targets (VMware)
 #define GUARD_MS    800     // undo late synthesized moves/VM warps this long after a restore
 #define TELEPORT_PX 400     // one-event non-injected jump >= this = touch, not a mouse
-#define SEAM_PX     16      // treat this margin around the touch monitor as touch land too
 
 static const wchar_t* APP_NAME = L"TouchCursorFix";
 static const wchar_t* RUN_KEY  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -87,8 +88,8 @@ static POINT             g_hp[HIST];
 static DWORD             g_ht[HIST];
 static volatile unsigned g_hidx;
 
-// --- touch monitors (from GetPointerDevices), stored as inflated RECTs so the
-// --- seam column can never be misclassified as "home" ---
+// --- exact touch monitor bounds (from GetPointerDevices). Inflating these
+// --- rectangles would classify pixels on neighboring displays as touch. ---
 static RECT g_touchRects[8];
 static int  g_touchMonCount;
 static BOOL g_lastOnTouch;          // previous hook event was on touch land
@@ -200,7 +201,6 @@ static void RefreshTouchMonitors() {
                     info[i].monitor) {
                     MONITORINFO mi = { sizeof(mi), {}, {}, 0 };
                     if (GetMonitorInfoW(info[i].monitor, &mi)) {
-                        InflateRect(&mi.rcMonitor, SEAM_PX, SEAM_PX);
                         g_touchRects[g_touchMonCount++] = mi.rcMonitor;
                     }
                 }
@@ -210,9 +210,9 @@ static void RefreshTouchMonitors() {
     if (g_touchMonCount != old) {
         LogF("touch monitors: %d", g_touchMonCount);
         for (int i = 0; i < g_touchMonCount; ++i)
-            LogF("  touch rect: (%ld,%ld)-(%ld,%ld) incl. %dpx margin",
+            LogF("  touch rect: (%ld,%ld)-(%ld,%ld)",
                  g_touchRects[i].left, g_touchRects[i].top,
-                 g_touchRects[i].right, g_touchRects[i].bottom, SEAM_PX);
+                 g_touchRects[i].right, g_touchRects[i].bottom);
     }
 }
 
@@ -258,6 +258,12 @@ static void CancelTouchState() {
     g_restoreFg = nullptr;
 }
 
+// Windows marks mouse events promoted from pen/touch input with this signature.
+// https://learn.microsoft.com/windows/win32/tablet/system-events-and-mouse-messages
+static BOOL IsDigitizerMouse(ULONG_PTR extraInfo) {
+    return (extraInfo & 0xFFFFFF00UL) == 0xFF515700UL;
+}
+
 // ---------------------------------------------------------------------------
 
 // Mouse hook: records positions, tracks "home", and classifies events. All
@@ -273,13 +279,15 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         g_ht[i] = m->time;          // event timestamp, no syscall
 
         BOOL injected   = (m->flags & LLMHF_INJECTED) != 0;
+        BOOL digitizer  = IsDigitizerMouse(m->dwExtraInfo);
         BOOL onTouch    = OnTouchMon(m->pt);
         BOOL wasOnTouch = g_lastOnTouch;
         g_lastOnTouch   = onTouch;
-        // Ground truth: RELATIVE mouse raw input within the last 60 ms means the
-        // user's hand is on the mouse. Touch synthesis and programmatic warps
-        // never produce relative mouse raw input, so this cannot be faked.
-        BOOL mouseDriven = (LONG)(m->time - g_mouseRawTick) < 60;
+        // Recent raw motion is only a hint: a finger can touch just after the
+        // mouse stops, and raw input can be delivered ahead of older hook events.
+        // An explicit digitizer signature always takes precedence over timing.
+        LONG mouseAge = (LONG)(m->time - g_mouseRawTick);
+        BOOL mouseDriven = !digitizer && mouseAge >= 0 && mouseAge < 60;
 
         LONG dx = m->pt.x - prev.x, dy = m->pt.y - prev.y;
         LONG d2 = dx * dx + dy * dy;
@@ -288,7 +296,14 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     (d2 >= TELEPORT_PX * TELEPORT_PX ||
                      (onTouch && !wasOnTouch && d2 >= 100 * 100));
 
-        if (!onTouch) {
+        if (digitizer) {
+            // Also detects small taps and injected touch promotion without
+            // depending on a cursor jump or background raw digitizer delivery.
+            if (onTouch && !g_userOnTouch) {
+                g_tpTime = m->time;
+                PostMessageW(g_hwnd, WM_TELEPORT, 1, 0);
+            }
+        } else if (!onTouch) {
             // Home must be a REAL on-screen position: the LL hook can report
             // unclamped coords (x=-1 while pushing against a boundary), and the
             // desktop has dead zones next to a small touch monitor (XENEON Edge
@@ -349,7 +364,11 @@ static void RehookIfDead() {
 
 // Common touch bookkeeping for both triggers (raw input + teleport fallback).
 static void TouchSeen(DWORD evt, const char* src) {
-    if (!g_enabled || g_userOnTouch) return;
+    if (!g_enabled) return;
+    if (g_userOnTouch) {
+        LogF("SEQ skip (%s): physical mouse owns touch monitor", src);
+        return;
+    }
     if (evt - g_lastTouchTick > SEQ_GAP_MS) {              // new touch sequence
         if (OnTouchMon(g_homePos)) {
             LogF("SEQ skip (%s): no valid home", src);
@@ -427,6 +446,49 @@ static int TrySnap(POINT a) {       // 1 = ok, 0 = overridden/pinned, -1 = clip 
     InjectMove(a);                  // position poke was overridden: use real input
     if (!GetCursorPos(&p)) return 1;
     return OnTouchMon(p) ? 0 : 1;
+}
+
+struct HomeMonitorCandidate {
+    POINT point;
+    BOOL found;
+};
+
+static BOOL CALLBACK FindHomeMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+    MONITORINFO info = {}; info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return TRUE;
+    POINT center = { info.rcMonitor.left + (info.rcMonitor.right - info.rcMonitor.left) / 2,
+                     info.rcMonitor.top + (info.rcMonitor.bottom - info.rcMonitor.top) / 2 };
+    if (OnTouchMon(center)) return TRUE;
+    HomeMonitorCandidate* candidate = reinterpret_cast<HomeMonitorCandidate*>(data);
+    if (!candidate->found || (info.dwFlags & MONITORINFOF_PRIMARY)) {
+        candidate->point = center;
+        candidate->found = TRUE;
+    }
+    return TRUE;
+}
+
+// An escape hatch for an isolated touch display. It never restores focus, so
+// keyboard input can remain in a touchscreen text field even after recovery.
+static void ReturnCursorHome() {
+    POINT target = g_homePos;
+    if (OnTouchMon(target) || !MonitorFromPoint(target, MONITOR_DEFAULTTONULL)) {
+        HomeMonitorCandidate candidate = {};
+        EnumDisplayMonitors(nullptr, nullptr, FindHomeMonitor, (LPARAM)&candidate);
+        if (!candidate.found) { LogF("HOME: no non-touch monitor available"); return; }
+        target = candidate.point;
+    }
+    CancelTouchState();
+    g_userOnTouch = FALSE;
+    g_homePos = target;
+    LogF("HOME requested: (%ld,%ld)", target.x, target.y);
+    TrySnap(target);
+    if (g_enabled) {
+        g_anchor = target;
+        g_haveAnchor = TRUE;
+        g_snapUntil = GetTickCount() + SNAP_WIN_MS;
+        SetTimer(g_hwnd, TIMER_ID, POLL_MS, nullptr);
+        g_timerOn = 1;
+    }
 }
 
 // Is the foreground window owned by the given exe (basename, case-insensitive)?
@@ -514,6 +576,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 if (GetRawInputData((HRAWINPUT)l, RID_INPUT, buf, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1) {
                     const RAWINPUT* ri = reinterpret_cast<const RAWINPUT*>(buf);
                     if (!(ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
+                        !IsDigitizerMouse(ri->data.mouse.ulExtraInformation) &&
                         (ri->data.mouse.lLastX || ri->data.mouse.lLastY))
                         g_mouseRawTick = (DWORD)GetMessageTime();   // real relative mouse motion
                 }
@@ -525,7 +588,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     }
 
     case WM_TELEPORT:
-        if (g_enabled) TouchSeen(g_tpTime, "teleport");
+        if (g_enabled) TouchSeen(g_tpTime, w ? "touch-signature" : "teleport");
         return 0;
 
     case WM_TIMER:
@@ -605,6 +668,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         RefreshTouchMonitors();
         return 0;
 
+    case WM_HOTKEY:
+        if (w == HOTKEY_HOME) ReturnCursorHome();
+        return 0;
+
     case WM_TRAY:
         if (LOWORD(l) == WM_RBUTTONUP || LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_LBUTTONUP) {
             POINT pt; GetCursorPos(&pt);
@@ -612,6 +679,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             AppendMenuW(m, MF_STRING | (g_enabled      ? MF_CHECKED : 0), IDM_ENABLED, L"Enabled");
             AppendMenuW(m, MF_STRING | (g_restoreFocus ? MF_CHECKED : 0), IDM_FOCUS,   L"Restore window focus");
             AppendMenuW(m, MF_STRING | (StartupEnabled()? MF_CHECKED : 0), IDM_STARTUP, L"Run at startup");
+            AppendMenuW(m, MF_STRING, IDM_HOME, L"Return cursor home\tCtrl+Alt+Home");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit");
             SetForegroundWindow(hwnd);
@@ -630,11 +698,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
         case IDM_FOCUS:   g_restoreFocus = !g_restoreFocus;
                           SaveBoolSetting(L"RestoreFocus", g_restoreFocus); break;
         case IDM_STARTUP: SetStartup(!StartupEnabled()); break;
+        case IDM_HOME:    ReturnCursorHome(); break;
         case IDM_EXIT:    DestroyWindow(hwnd); break;
         }
         return 0;
 
     case WM_DESTROY:
+        UnregisterHotKey(hwnd, HOTKEY_HOME);
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
         if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
         if (g_winHook)   UnhookWinEvent(g_winHook);
@@ -683,6 +753,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
                              nullptr, nullptr, hInst, nullptr);   // normal (hidden) window
     if (!g_hwnd) return 1;
 
+    if (!RegisterHotKey(g_hwnd, HOTKEY_HOME, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_HOME))
+        LogF("Ctrl+Alt+Home unavailable: %lu (tray recovery remains available)", GetLastError());
     TrayAdd();
 
     // Raw input, as an input sink: touch screens (0x0D/0x04), pens (0x02), pen

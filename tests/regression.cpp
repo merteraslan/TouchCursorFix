@@ -25,15 +25,49 @@ static DWORD WINAPI TestGetModuleFileNameW(HMODULE module, LPWSTR output, DWORD 
 }
 #define GetModuleFileNameW TestGetModuleFileNameW
 
+static bool mockCursorEnabled;
+static POINT mockCursor;
+static BOOL WINAPI TestGetCursorPos(LPPOINT point) {
+    if (!mockCursorEnabled) return GetCursorPos(point);
+    *point = mockCursor;
+    return TRUE;
+}
+#define GetCursorPos TestGetCursorPos
+
+static bool mockDisplaysEnabled;
+static RECT mockTouchDisplay = { 4507, -2175, 6427, -975 };
+static BOOL WINAPI TestGetPointerDevices(UINT32* count, POINTER_DEVICE_INFO* info) {
+    if (!mockDisplaysEnabled) return GetPointerDevices(count, info);
+    if (!info) { *count = 1; return TRUE; }
+    if (*count < 1) return FALSE;
+    *count = 1;
+    info[0] = {};
+    info[0].pointerDeviceType = POINTER_DEVICE_TYPE_TOUCH;
+    info[0].monitor = (HMONITOR)1;
+    return TRUE;
+}
+static BOOL WINAPI TestGetMonitorInfoW(HMONITOR monitor, LPMONITORINFO info) {
+    if (!mockDisplaysEnabled) return GetMonitorInfoW(monitor, info);
+    info->rcMonitor = info->rcWork = mockTouchDisplay;
+    return TRUE;
+}
+#define GetPointerDevices TestGetPointerDevices
+#define GetMonitorInfoW TestGetMonitorInfoW
+
 // Spy on input APIs so a failing regression cannot move the real mouse,
 // release another app's cursor confinement, or change the active window.
 static unsigned inputCalls;
-static BOOL WINAPI TestSetCursorPos(int, int) { ++inputCalls; return TRUE; }
+static unsigned focusCalls;
+static BOOL WINAPI TestSetCursorPos(int x, int y) {
+    ++inputCalls;
+    if (mockCursorEnabled) mockCursor = { x, y };
+    return TRUE;
+}
 static UINT WINAPI TestSendInput(UINT count, LPINPUT, int) { ++inputCalls; return count; }
 static BOOL WINAPI TestClipCursor(const RECT*) { ++inputCalls; return TRUE; }
-static BOOL WINAPI TestSetForegroundWindow(HWND) { ++inputCalls; return TRUE; }
-static BOOL WINAPI TestBringWindowToTop(HWND) { ++inputCalls; return TRUE; }
-static BOOL WINAPI TestAttachThreadInput(DWORD, DWORD, BOOL) { ++inputCalls; return TRUE; }
+static BOOL WINAPI TestSetForegroundWindow(HWND) { ++inputCalls; ++focusCalls; return TRUE; }
+static BOOL WINAPI TestBringWindowToTop(HWND) { ++inputCalls; ++focusCalls; return TRUE; }
+static BOOL WINAPI TestAttachThreadInput(DWORD, DWORD, BOOL) { ++inputCalls; ++focusCalls; return TRUE; }
 #define SetCursorPos TestSetCursorPos
 #define SendInput TestSendInput
 #define ClipCursor TestClipCursor
@@ -44,9 +78,21 @@ static BOOL WINAPI TestAttachThreadInput(DWORD, DWORD, BOOL) { ++inputCalls; ret
 #include "../main.cpp"
 #undef wWinMain
 
+static HKEY isolatedRegistryRoot;
+static wchar_t isolatedRegistryPath[128];
+
+static void CleanupFailedTest() {
+    if (!isolatedRegistryRoot) return;
+    RegOverridePredefKey(HKEY_CURRENT_USER, nullptr);
+    RegCloseKey(isolatedRegistryRoot);
+    isolatedRegistryRoot = nullptr;
+    RegDeleteTreeW(HKEY_CURRENT_USER, isolatedRegistryPath);
+}
+
 static void Check(bool condition, const char* description) {
     if (!condition) {
         fprintf(stderr, "FAIL: %s\n", description);
+        CleanupFailedTest();
         exit(1);
     }
 }
@@ -173,6 +219,89 @@ static void TestLogPath() {
     mockModulePathEnabled = false;
 }
 
+static void TestTouchReturnClassification() {
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"TouchCursorFixClassificationTest";
+    Check(RegisterClassW(&wc) != 0, "register classification test window");
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0,
+                             HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    Check(g_hwnd != nullptr, "create classification test window");
+    mockDisplaysEnabled = true;
+    RefreshTouchMonitors();
+    Check(!OnTouchMon({4506, -1200}) && OnTouchMon({4507, -1200}),
+          "neighboring monitor edge must not be classified as the touchscreen");
+    mockCursorEnabled = true;
+    mockCursor = {100, 100};
+    g_enabled = TRUE;
+    g_restoreFocus = FALSE;
+    CancelTouchState();
+    SeedTracking();
+
+    const DWORD now = GetTickCount();
+    g_mouseRawTick = now - 10;
+    MSLLHOOKSTRUCT touch = {};
+    touch.pt = {5000, -1200};
+    touch.time = now;
+    touch.dwExtraInfo = 0xFF515780; // documented Windows touch signature
+    mockCursor = touch.pt;
+    MouseProc(HC_ACTION, WM_MOUSEMOVE, (LPARAM)&touch);
+    Check(!g_userOnTouch, "touch after recent mouse motion must not claim mouse ownership");
+    MSG event;
+    Check(PeekMessageW(&event, g_hwnd, WM_TELEPORT, WM_TELEPORT, PM_REMOVE) != 0,
+          "explicit touch signature schedules a return without raw digitizer input");
+    WndProc(g_hwnd, event.message, event.wParam, event.lParam);
+    Check(g_pending && g_haveAnchor && g_anchor.x == 100 && g_anchor.y == 100,
+          "touch return retains the last non-touch mouse anchor");
+    g_lastTouchTick = GetTickCount() - RESTORE_MS - 1;
+    WndProc(g_hwnd, WM_TIMER, TIMER_ID, 0);
+    Check(mockCursor.x == 100 && mockCursor.y == 100,
+          "touch returns the cursor without changing keyboard focus");
+
+    CancelTouchState();
+    SeedTracking();
+    g_mouseRawTick = now + 10;
+    touch.time = now;
+    touch.dwExtraInfo = 0;
+    mockCursor = touch.pt;
+    MouseProc(HC_ACTION, WM_MOUSEMOVE, (LPARAM)&touch);
+    Check(!g_userOnTouch,
+          "a later raw-input timestamp cannot mark an older touch as physical mouse motion");
+
+    // Real physical movement onto the touch display still grants ownership.
+    CancelTouchState();
+    mockCursor = {100, 100};
+    SeedTracking();
+    touch.time = now;
+    g_mouseRawTick = now - 1;
+    mockCursor = touch.pt;
+    MouseProc(HC_ACTION, WM_MOUSEMOVE, (LPARAM)&touch);
+    Check(g_userOnTouch, "real mouse motion may deliberately enter the touchscreen");
+
+    // Recovery must override this ownership, but never steal text-field focus.
+    const unsigned previousFocusCalls = focusCalls;
+    WndProc(g_hwnd, WM_HOTKEY, HOTKEY_HOME, 0);
+    Check(mockCursor.x == 100 && mockCursor.y == 100 && !g_userOnTouch,
+          "recovery hotkey returns from a mouse-owned isolated touchscreen");
+    Check(focusCalls == previousFocusCalls && !g_restoreFg,
+          "recovery preserves keyboard focus");
+    CancelTouchState();
+    g_enabled = FALSE;
+    mockCursor = touch.pt;
+    WndProc(g_hwnd, WM_COMMAND, IDM_HOME, 0);
+    Check(mockCursor.x == 100 && mockCursor.y == 100 && !g_timerOn,
+          "tray recovery also works while automatic correction is disabled");
+
+    CancelTouchState();
+    DestroyWindow(g_hwnd);
+    g_hwnd = nullptr;
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    mockDisplaysEnabled = false;
+    mockCursorEnabled = false;
+    g_touchMonCount = 0;
+}
+
 int main() {
     wchar_t keyPath[128];
     swprintf(keyPath, 128, L"Software\\TouchCursorFixRegression_%lu", GetCurrentProcessId());
@@ -180,18 +309,22 @@ int main() {
     Check(RegCreateKeyExW(HKEY_CURRENT_USER, keyPath, 0, nullptr, 0,
                           KEY_ALL_ACCESS, nullptr, &sandbox, nullptr)
           == ERROR_SUCCESS, "create temporary registry root");
+    isolatedRegistryRoot = sandbox;
+    wcscpy(isolatedRegistryPath, keyPath);
     Check(RegOverridePredefKey(HKEY_CURRENT_USER, sandbox) == ERROR_SUCCESS,
           "isolate registry writes from user preferences");
 
     TestPreferences();
     TestDisableCancelsQueuedWork();
     TestLogPath();
+    TestTouchReturnClassification();
 
     Check(RegOverridePredefKey(HKEY_CURRENT_USER, nullptr) == ERROR_SUCCESS,
           "restore registry mapping");
     RegCloseKey(sandbox);
+    isolatedRegistryRoot = nullptr;
     Check(RegDeleteTreeW(HKEY_CURRENT_USER, keyPath) == ERROR_SUCCESS,
           "remove temporary test registry data");
-    puts("PASS: preferences, disabled input state, log paths");
+    puts("PASS: preferences, disabled input state, log paths, touch classification, recovery");
     return 0;
 }

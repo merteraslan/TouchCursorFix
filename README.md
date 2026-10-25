@@ -40,6 +40,7 @@ Right-click the tray icon:
 | **Enabled** | master toggle (remembered between runs) |
 | **Restore window focus** | give focus back to the pre-touch window after a tap (remembered between runs) |
 | **Run at startup** | auto-start at login (HKCU `Run` key — no admin, no scheduled task) |
+| **Return cursor home** | return the cursor to its last non-touch position without changing keyboard focus; shortcut **Ctrl+Alt+Home** |
 | **Exit** | quit |
 
 Preferences are stored as DWORD values `Enabled` and `RestoreFocus` under
@@ -49,23 +50,28 @@ you touched on the touchscreen while still returning the mouse cursor home.
 **Run at startup** remains a separate, opt-in setting.
 Disabling the tool cancels pending cursor/focus corrections immediately;
 re-enabling starts tracking from the current cursor and foreground window.
+If an isolated touchscreen leaves the cursor stranded, press **Ctrl+Alt+Home**
+or select **Return cursor home** in the tray. If the previous position is no
+longer on an available non-touch monitor, recovery uses a non-touch monitor's
+center (preferring the primary display). If another app already owns the
+shortcut, tray recovery is still available.
 
 ## How it works
 
 1. Windows reports which monitor belongs to the touch digitizer (`GetPointerDevices`) — that's *touch land*; everywhere else is *home*
 2. A `WH_MOUSE_LL` hook records cursor positions and tracks your last *home* position
-3. Touches are detected two independent ways: raw digitizer input, **and** the hook spotting a physically-impossible cursor teleport onto the touch monitor (catches taps whose raw input gets swallowed by the target window)
+3. Touches are detected using Windows' pen/touch mouse-event signature and raw digitizer input, with cursor-jump inference as a fallback when the target swallows raw input
 4. Once the touch settles: the pre-touch window gets focus back first (VMs/games release cursor grabs when they lose it), then the cursor snaps home — retrying until it sticks
-5. Move the mouse onto the touch monitor yourself and the tool **stands down instantly** until you leave — it watches relative mouse raw input, so it *knows* when your hand is on the mouse (touch synthesis can't fake that signal)
+5. Move the mouse onto the touch monitor yourself and the tool **stands down** until you leave. An explicit pen/touch event is never treated as physical mouse motion just because the mouse moved recently.
 
 <details>
 <summary><b>Implementation notes</b> (for the curious)</summary>
 <br>
 
 - Registers digitizer usages `0x0D/0x04` (touch screen), `0x02` (pen), `0x01` (pen digitizer) — deliberately **not** `0x05` (precision touchpads). Falls back to the whole `0x0D` page for exotic devices.
-- *Home* is the last **real on-screen** cursor position off touch land — unclamped hook coordinates, monitor-seam pixels, and desktop dead zones (small touch monitors like a 2560x720 touch bar leave one) can never poison it. The seam gets a 16 px margin.
+- Touch monitors use their exact bounds: a neighbor's edge must not be treated as part of the touchscreen. *Home* is the last real on-screen cursor position outside those bounds; signed touch events never overwrite it.
 - A teleport = a non-injected single-event jump of 400+ px (or 100+ px crossing onto touch land). Real mice move a few px per event; only touch synthesis teleports.
-- Generic mice are also registered (raw input) purely as a **"hand on mouse" signal**: relative mouse raw input in the last 60 ms suppresses teleport detection (a driven mouse just moves fast) and grants you the touch monitor immediately — touch synthesis and `SetCursorPos`/`SendInput` warps produce no relative mouse input, so the signal can't be faked.
+- Generic mice are registered as a recent-motion hint. Only an earlier raw-input timestamp within 60 ms counts, and the documented Windows pen/touch signature takes precedence over this timing hint.
 - Foreign `ClipCursor` grabs are cleared before snapping; VMware's hard mouse grab (VM without Tools) is broken with VMware's own Ctrl+Alt ungrab hotkey — only when `vmware.exe` is the foreground process.
 - Snaps escalate from `SetCursorPos` to real injected mouse input (`SendInput`) when the pointer stack overrides the position poke, and keep retrying for up to 3 s. Programmatic cursor placements onto touch land re-open the corrective window whenever they happen.
 - Focus restore uses the `AttachThreadInput` technique — no global system settings are touched.

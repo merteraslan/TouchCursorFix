@@ -83,8 +83,11 @@ MinGW-w64 (g++ + windres), nothing else:
 
 ```powershell
 windres TouchCursorFix.rc -O coff -o TouchCursorFix.res.o
-g++ -O2 -s -municode -mwindows main.cpp TouchCursorFix.res.o -o TouchCursorFix.exe -luser32 -lshell32 -ladvapi32
+g++ -std=c++11 -O2 -s -static -municode -mwindows main.cpp TouchCursorFix.res.o -o TouchCursorFix.exe -luser32 -lshell32 -ladvapi32
 ```
+
+`-static` includes the C++ runtime so the executable does not require separate
+compiler runtime DLLs. See [tests/README.md](tests/README.md) for regression tests.
 
 The icon is code — `make_icon.ps1` redraws and repacks `TouchCursorFix.ico` from scratch if you want to restyle it.
 

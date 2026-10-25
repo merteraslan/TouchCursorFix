@@ -9,6 +9,22 @@
 #include <cstdlib>
 #include <string>
 
+static bool mockModulePathEnabled;
+static bool mockModulePathFailure;
+static std::wstring mockModulePath;
+static unsigned modulePathReads;
+static DWORD WINAPI TestGetModuleFileNameW(HMODULE module, LPWSTR output, DWORD size) {
+    if (!mockModulePathEnabled) return GetModuleFileNameW(module, output, size);
+    ++modulePathReads;
+    if (mockModulePathFailure) return 0;
+    DWORD length = (DWORD)mockModulePath.size();
+    DWORD copied = length < size ? length : size - 1;
+    wmemcpy(output, mockModulePath.c_str(), copied);
+    output[copied] = L'\0';
+    return length < size ? length : size;
+}
+#define GetModuleFileNameW TestGetModuleFileNameW
+
 // Spy on input APIs so a failing regression cannot move the real mouse,
 // release another app's cursor confinement, or change the active window.
 static unsigned inputCalls;
@@ -120,6 +136,43 @@ static void TestDisableCancelsQueuedWork() {
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
 }
 
+static void TestLogPath() {
+    mockModulePathEnabled = true;
+    mockModulePath = L"C:\\tools\\TouchCursorFix.exe";
+    Check(ExecutableSiblingPath(L"TouchCursorFix.log")
+          == L"C:\\tools\\TouchCursorFix.log", "normal log path");
+
+    // The executable fits in MAX_PATH, but replacing a.exe with the longer log
+    // name does not. The original lstrcpyW overran its stack buffer here.
+    const std::wstring directory = L"C:\\" + std::wstring(240, L'x') + L"\\";
+    mockModulePath = directory + L"a.exe";
+    const std::wstring expected = directory + L"TouchCursorFix.log";
+    Check(mockModulePath.size() < MAX_PATH && expected.size() >= MAX_PATH,
+          "regression fixture crosses the fixed-buffer boundary");
+    Check(ExecutableSiblingPath(L"TouchCursorFix.log") == expected,
+          "longer log filename cannot overflow the executable buffer");
+
+    mockModulePath = L"C:\\" + std::wstring(900, L'x') + L"\\a.exe";
+    modulePathReads = 0;
+    Check(ExecutableSiblingPath(L"TouchCursorFix.log")
+          == L"C:\\" + std::wstring(900, L'x') + L"\\TouchCursorFix.log"
+          && modulePathReads > 1, "truncated executable path is retried");
+    mockModulePath = L"C:\\deneme-\u00e7\u011f\\a.exe";
+    Check(ExecutableSiblingPath(L"TouchCursorFix.log")
+          == L"C:\\deneme-\u00e7\u011f\\TouchCursorFix.log", "Unicode log path");
+    mockModulePath = L"a.exe";
+    Check(ExecutableSiblingPath(L"TouchCursorFix.log").empty(),
+          "missing directory fails safely");
+    mockModulePathFailure = true;
+    Check(ExecutableSiblingPath(L"TouchCursorFix.log").empty(),
+          "module path query failure fails safely");
+    mockModulePathFailure = false;
+    mockModulePath.assign(32768, L'x');
+    Check(ExecutableSiblingPath(L"TouchCursorFix.log").empty(),
+          "path growth is bounded");
+    mockModulePathEnabled = false;
+}
+
 int main() {
     wchar_t keyPath[128];
     swprintf(keyPath, 128, L"Software\\TouchCursorFixRegression_%lu", GetCurrentProcessId());
@@ -132,12 +185,13 @@ int main() {
 
     TestPreferences();
     TestDisableCancelsQueuedWork();
+    TestLogPath();
 
     Check(RegOverridePredefKey(HKEY_CURRENT_USER, nullptr) == ERROR_SUCCESS,
           "restore registry mapping");
     RegCloseKey(sandbox);
     Check(RegDeleteTreeW(HKEY_CURRENT_USER, keyPath) == ERROR_SUCCESS,
           "remove temporary test registry data");
-    puts("PASS: preferences, disabled input state");
+    puts("PASS: preferences, disabled input state, log paths");
     return 0;
 }

@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cwchar>
+#include <string>
 
 #ifndef RIDEV_PAGEONLY
 #define RIDEV_PAGEONLY 0x00000020
@@ -132,6 +133,26 @@ static void LogF(const char* fmt, ...) {
     va_end(ap);
     fputc('\n', g_logf);
     fflush(g_logf);
+}
+
+// GetModuleFileNameW reports truncation by returning the supplied capacity.
+// Grow the buffer, then construct the sibling path without fixed-size copies.
+static std::wstring ExecutableSiblingPath(const wchar_t* filename) {
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD length = GetModuleFileNameW(nullptr, &path[0], (DWORD)path.size());
+        if (!length) return {};
+        if (length < path.size()) {
+            path.resize(length);
+            std::wstring::size_type slash = path.find_last_of(L"\\/");
+            if (slash == std::wstring::npos) return {};
+            path.resize(slash + 1);
+            path += filename;
+            return path;
+        }
+        if (path.size() >= 32768) return {};
+        path.resize(path.size() * 2 < 32768 ? path.size() * 2 : 32768);
+    }
 }
 
 // Preserve the original defaults when a preference is absent or invalid.
@@ -631,11 +652,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
 
     // Debug logging: run with -log to write TouchCursorFix.log next to the exe.
     if (cmd && wcsstr(cmd, L"-log")) {
-        wchar_t p[MAX_PATH];
-        GetModuleFileNameW(nullptr, p, MAX_PATH);
-        wchar_t* s = wcsrchr(p, L'\\');
-        lstrcpyW(s ? s + 1 : p, L"TouchCursorFix.log");
-        g_logf = _wfopen(p, L"w");
+        std::wstring path = ExecutableSiblingPath(L"TouchCursorFix.log");
+        if (!path.empty()) g_logf = _wfopen(path.c_str(), L"w");
         LogF("start (v1.3.0)");
     }
 

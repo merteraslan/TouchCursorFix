@@ -201,6 +201,42 @@ static BOOL OnTouchMon(POINT pt) {
     return FALSE;
 }
 
+// Used at startup and when re-enabling: do not reuse an anchor/focus from before
+// the disabled interval, when the user may have moved to another monitor.
+static void SeedTracking() {
+    POINT p = {};
+    if (!GetCursorPos(&p)) return;
+    g_hp[0] = p; g_ht[0] = GetTickCount(); g_hidx = 1;
+    g_lastOnTouch = OnTouchMon(p);
+    g_userOnTouch = g_lastOnTouch;
+    if (g_lastOnTouch) {
+        g_homePos.x = GetSystemMetrics(SM_CXSCREEN) / 2;
+        g_homePos.y = GetSystemMetrics(SM_CYSCREEN) / 2;
+    } else {
+        g_homePos = p;
+    }
+    g_homeTime = GetTickCount();
+    g_realForeground = GetForegroundWindow();
+}
+
+static void CancelTouchState() {
+    if (g_hwnd) {
+        KillTimer(g_hwnd, TIMER_ID);
+        MSG queued;
+        while (PeekMessageW(&queued, g_hwnd, WM_TELEPORT, WM_TELEPORT, PM_REMOVE)) {}
+    }
+    InterlockedExchange(&g_timerOn, 0);
+    InterlockedExchange(&g_pending, 0);
+    InterlockedExchange(&g_parked, 0);
+    InterlockedExchange(&g_warped, 0);
+    g_snapUntil = g_guardUntil = g_suppressFgUntil = 0;
+    g_seqStart = g_tpTime = 0;
+    g_lastTouchTick = GetTickCount() - SEQ_GAP_MS - 1;
+    g_haveAnchor = g_snapDone = g_ungrabSent = FALSE;
+    g_anchor = {};
+    g_restoreFg = nullptr;
+}
+
 // ---------------------------------------------------------------------------
 
 // Mouse hook: records positions, tracks "home", and classifies events. All
@@ -292,7 +328,7 @@ static void RehookIfDead() {
 
 // Common touch bookkeeping for both triggers (raw input + teleport fallback).
 static void TouchSeen(DWORD evt, const char* src) {
-    if (g_userOnTouch) return;                             // user owns touch land right now
+    if (!g_enabled || g_userOnTouch) return;
     if (evt - g_lastTouchTick > SEQ_GAP_MS) {              // new touch sequence
         if (OnTouchMon(g_homePos)) {
             LogF("SEQ skip (%s): no valid home", src);
@@ -473,6 +509,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_TIMER:
         if (w == TIMER_REHOOK) { RehookIfDead(); RefreshTouchMonitors(); return 0; }
+        if (w != TIMER_ID) return 0;
+        // KillTimer cannot remove a WM_TIMER already queued for delivery.
+        if (!g_enabled) { CancelTouchState(); return 0; }
         if (g_pending && (GetTickCount() - g_lastTouchTick) >= RESTORE_MS) {
             InterlockedExchange(&g_pending, 0);
             // Focus FIRST: a VM/game that grabbed the cursor releases its grab
@@ -563,9 +602,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
     case WM_COMMAND:
         switch (LOWORD(w)) {
-        case IDM_ENABLED: g_enabled = !g_enabled; InterlockedExchange(&g_pending, 0);
-                          g_snapUntil = 0; g_guardUntil = 0;
-                          InterlockedExchange(&g_warped, 0);
+        case IDM_ENABLED: g_enabled = !g_enabled;
+                          CancelTouchState();
+                          if (g_enabled) SeedTracking();
                           SaveBoolSetting(L"Enabled", g_enabled); break;
         case IDM_FOCUS:   g_restoreFocus = !g_restoreFocus;
                           SaveBoolSetting(L"RestoreFocus", g_restoreFocus); break;
@@ -612,21 +651,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
 
     RefreshTouchMonitors();
 
-    // seed history + home + foreground with current state
-    {
-        POINT p; GetCursorPos(&p);
-        g_hp[0] = p; g_ht[0] = GetTickCount(); g_hidx = 1;
-        g_lastOnTouch = OnTouchMon(p);
-        g_userOnTouch = g_lastOnTouch;
-        if (g_lastOnTouch) {   // started with cursor on touch land: home = primary center
-            g_homePos.x = GetSystemMetrics(SM_CXSCREEN) / 2;
-            g_homePos.y = GetSystemMetrics(SM_CYSCREEN) / 2;
-        } else {
-            g_homePos = p;
-        }
-        g_homeTime = GetTickCount();
-    }
-    g_realForeground = GetForegroundWindow();
+    CancelTouchState();
+    SeedTracking();
     g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSW wc = {};

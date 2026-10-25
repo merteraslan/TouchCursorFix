@@ -47,6 +47,8 @@ Preferences are stored as DWORD values `Enabled` and `RestoreFocus` under
 installation. Turn off **Restore window focus** to keep typing in a text field
 you touched on the touchscreen while still returning the mouse cursor home.
 **Run at startup** remains a separate, opt-in setting.
+Disabling the tool cancels pending cursor/focus corrections immediately;
+re-enabling starts tracking from the current cursor and foreground window.
 
 ## How it works
 

@@ -99,20 +99,25 @@ static void Check(bool condition, const char* description) {
 
 static void TestPreferences() {
     LoadSettings();
-    Check(g_enabled && g_restoreFocus, "missing preferences retain defaults");
+    Check(g_enabled && g_restoreFocus && !g_keepMouseOffTouch,
+          "missing preferences retain defaults");
 
     // Exercise the same command handlers as the tray menu, then simulate restart.
     WndProc(nullptr, WM_COMMAND, IDM_ENABLED, 0);
     WndProc(nullptr, WM_COMMAND, IDM_FOCUS, 0);
+    WndProc(nullptr, WM_COMMAND, IDM_KEEP_OFF_TOUCH, 0);
     g_enabled = g_restoreFocus = TRUE;
     LoadSettings();
-    Check(!g_enabled && !g_restoreFocus, "disabled preferences survive reload");
+    Check(!g_enabled && !g_restoreFocus && g_keepMouseOffTouch,
+          "disabled preferences and isolated-touch mode survive reload");
 
     WndProc(nullptr, WM_COMMAND, IDM_ENABLED, 0);
     WndProc(nullptr, WM_COMMAND, IDM_FOCUS, 0);
+    WndProc(nullptr, WM_COMMAND, IDM_KEEP_OFF_TOUCH, 0);
     g_enabled = g_restoreFocus = FALSE;
     LoadSettings();
-    Check(g_enabled && g_restoreFocus, "enabled preferences survive reload");
+    Check(g_enabled && g_restoreFocus && !g_keepMouseOffTouch,
+          "enabled preferences and ordinary mouse mode survive reload");
 
     HKEY key;
     Check(RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, KEY_SET_VALUE, &key)
@@ -120,12 +125,15 @@ static void TestPreferences() {
     DWORD invalid = 2;
     RegSetValueExW(key, L"Enabled", 0, REG_DWORD,
                    (const BYTE*)&invalid, sizeof(invalid));
+    RegSetValueExW(key, L"KeepMouseOffTouch", 0, REG_DWORD,
+                   (const BYTE*)&invalid, sizeof(invalid));
     const wchar_t text[] = L"false";
     RegSetValueExW(key, L"RestoreFocus", 0, REG_SZ,
                    (const BYTE*)text, sizeof(text));
     RegCloseKey(key);
     LoadSettings();
-    Check(g_enabled && g_restoreFocus, "invalid values retain defaults");
+    Check(g_enabled && g_restoreFocus && !g_keepMouseOffTouch,
+          "invalid values retain defaults");
 
     HKEY keyToRemove;
     Check(RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, KEY_READ, &keyToRemove)
@@ -292,6 +300,48 @@ static void TestTouchReturnClassification() {
     WndProc(g_hwnd, WM_COMMAND, IDM_HOME, 0);
     Check(mockCursor.x == 100 && mockCursor.y == 100 && !g_timerOn,
           "tray recovery also works while automatic correction is disabled");
+
+    // Reproduce the hardware log: a touch return was canceled because mouse
+    // motion on the stranded touch display was treated as intentional entry.
+    CancelTouchState();
+    g_enabled = TRUE;
+    g_keepMouseOffTouch = TRUE;
+    g_userOnTouch = TRUE;
+    g_restoreFocus = TRUE; // even in this mode, resume must preserve focus
+    mockCursor = touch.pt;
+    const unsigned beforeResumeFocus = focusCalls;
+    MouseMotionSeen(now);
+    Check(mockCursor.x == 100 && mockCursor.y == 100 && !g_userOnTouch,
+          "isolated touchscreen returns immediately when physical mouse motion resumes");
+    Check(focusCalls == beforeResumeFocus,
+          "automatic mouse-resume recovery does not steal touchscreen text-field focus");
+
+    // A delayed hook sample must not reclaim ownership after raw input recovers.
+    mockCursor = touch.pt;
+    touch.time = now;
+    MouseProc(HC_ACTION, WM_MOUSEMOVE, (LPARAM)&touch);
+    Check(!g_userOnTouch, "isolated mode never cancels return for touchscreen mouse motion");
+    g_userOnTouch = TRUE; // stale state from a delayed event
+    TouchSeen(now, "test");
+    Check(!g_userOnTouch && g_pending,
+          "stale ownership cannot suppress touch correction in isolated mode");
+
+    CancelTouchState();
+    mockCursor = {200, 200};
+    const unsigned beforeOffTouch = inputCalls;
+    MouseMotionSeen(now);
+    Check(inputCalls == beforeOffTouch && mockCursor.x == 200,
+          "isolated mode leaves normal monitors alone");
+    mockCursor = touch.pt;
+    g_enabled = FALSE;
+    MouseMotionSeen(now);
+    Check(mockCursor.x == touch.pt.x && !g_timerOn,
+          "disabled tool does not apply isolated-touch recovery");
+    g_enabled = TRUE;
+    g_keepMouseOffTouch = FALSE;
+    MouseMotionSeen(now);
+    Check(mockCursor.x == touch.pt.x,
+          "ordinary mode preserves intentional mouse use on the touchscreen");
 
     CancelTouchState();
     DestroyWindow(g_hwnd);

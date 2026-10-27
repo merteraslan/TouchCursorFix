@@ -55,6 +55,7 @@
 #define IDM_STARTUP 102
 #define IDM_EXIT    103
 #define IDM_HOME    104
+#define IDM_KEEP_OFF_TOUCH 105
 #define HOTKEY_HOME 1
 #define TIMER_ID     1
 #define TIMER_REHOOK 2
@@ -123,6 +124,7 @@ static volatile DWORD  g_suppressFgUntil;
 // --- settings ---
 static BOOL g_enabled      = TRUE;
 static BOOL g_restoreFocus = TRUE;
+static BOOL g_keepMouseOffTouch = FALSE;
 
 // --- optional debug logging (run with -log) ---
 static FILE* g_logf;
@@ -167,6 +169,7 @@ static BOOL ReadBoolSetting(const wchar_t* name, BOOL fallback) {
 static void LoadSettings() {
     g_enabled      = ReadBoolSetting(L"Enabled", TRUE);
     g_restoreFocus = ReadBoolSetting(L"RestoreFocus", TRUE);
+    g_keepMouseOffTouch = ReadBoolSetting(L"KeepMouseOffTouch", FALSE);
 }
 
 static void SaveBoolSetting(const wchar_t* name, BOOL enabled) {
@@ -229,7 +232,7 @@ static void SeedTracking() {
     if (!GetCursorPos(&p)) return;
     g_hp[0] = p; g_ht[0] = GetTickCount(); g_hidx = 1;
     g_lastOnTouch = OnTouchMon(p);
-    g_userOnTouch = g_lastOnTouch;
+    g_userOnTouch = g_lastOnTouch && !g_keepMouseOffTouch;
     if (g_lastOnTouch) {
         g_homePos.x = GetSystemMetrics(SM_CXSCREEN) / 2;
         g_homePos.y = GetSystemMetrics(SM_CYSCREEN) / 2;
@@ -299,7 +302,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (digitizer) {
             // Also detects small taps and injected touch promotion without
             // depending on a cursor jump or background raw digitizer delivery.
-            if (onTouch && !g_userOnTouch) {
+            if (onTouch && (!g_userOnTouch || g_keepMouseOffTouch)) {
                 g_tpTime = m->time;
                 PostMessageW(g_hwnd, WM_TELEPORT, 1, 0);
             }
@@ -313,10 +316,16 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             }
             g_userOnTouch = FALSE;
         } else if (mouseDriven && !injected && d2 > 0) {
-            // The physical mouse is moving on touch land: the user came here on
-            // purpose. Stand down instantly and abort anything in flight.
-            g_userOnTouch = TRUE;
-            InterlockedExchange(&g_pending, 0);
+            if (g_keepMouseOffTouch) {
+                // In isolated-touchscreen setups, this can be the first mouse
+                // movement AFTER a failed touch return, not intentional entry.
+                g_userOnTouch = FALSE;
+                g_tpTime = m->time;
+                PostMessageW(g_hwnd, WM_TELEPORT, 0, 0);
+            } else {
+                g_userOnTouch = TRUE;
+                InterlockedExchange(&g_pending, 0);
+            }
         } else if (jump) {
             // Touch trigger #2: synthesized tap-move landed on the touch monitor.
             // Works even when the tap's raw input is swallowed (VMware windows).
@@ -365,10 +374,11 @@ static void RehookIfDead() {
 // Common touch bookkeeping for both triggers (raw input + teleport fallback).
 static void TouchSeen(DWORD evt, const char* src) {
     if (!g_enabled) return;
-    if (g_userOnTouch) {
+    if (g_userOnTouch && !g_keepMouseOffTouch) {
         LogF("SEQ skip (%s): physical mouse owns touch monitor", src);
         return;
     }
+    if (g_keepMouseOffTouch) g_userOnTouch = FALSE;
     if (evt - g_lastTouchTick > SEQ_GAP_MS) {              // new touch sequence
         if (OnTouchMon(g_homePos)) {
             LogF("SEQ skip (%s): no valid home", src);
@@ -491,6 +501,20 @@ static void ReturnCursorHome() {
     }
 }
 
+// Processed on the normal-priority raw-input path, not a low-priority WM_TIMER.
+// This also recovers when a slow target delayed the hook/touch notification or
+// the hook was temporarily removed by Windows: picking up the mouse is enough.
+static void MouseMotionSeen(DWORD timestamp) {
+    g_mouseRawTick = timestamp;
+    if (g_enabled && g_keepMouseOffTouch) {
+        POINT cursor;
+        if (GetCursorPos(&cursor) && OnTouchMon(cursor)) {
+            LogF("MOUSE RESUME: cursor on touch monitor; returning home");
+            ReturnCursorHome();
+        }
+    }
+}
+
 // Is the foreground window owned by the given exe (basename, case-insensitive)?
 static BOOL FgIsExe(const wchar_t* name) {
     DWORD pid = 0;
@@ -578,7 +602,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                     if (!(ri->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) &&
                         !IsDigitizerMouse(ri->data.mouse.ulExtraInformation) &&
                         (ri->data.mouse.lLastX || ri->data.mouse.lLastY))
-                        g_mouseRawTick = (DWORD)GetMessageTime();   // real relative mouse motion
+                        MouseMotionSeen((DWORD)GetMessageTime());
                 }
             } else if (g_enabled) {
                 TouchSeen((DWORD)GetMessageTime(), "rawinput");     // digitizer = touch/pen
@@ -621,7 +645,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                          g_anchor.x, g_anchor.y);
                 }
             }
-            if (g_snapUntil && g_userOnTouch) {            // user took over - stand down
+            if (g_snapUntil && g_userOnTouch && !g_keepMouseOffTouch) {
                 LogF("SNAP canceled (user moving on touch land)");
                 g_snapUntil = 0;
             }
@@ -678,6 +702,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             HMENU m = CreatePopupMenu();
             AppendMenuW(m, MF_STRING | (g_enabled      ? MF_CHECKED : 0), IDM_ENABLED, L"Enabled");
             AppendMenuW(m, MF_STRING | (g_restoreFocus ? MF_CHECKED : 0), IDM_FOCUS,   L"Restore window focus");
+            AppendMenuW(m, MF_STRING | (g_keepMouseOffTouch ? MF_CHECKED : 0),
+                         IDM_KEEP_OFF_TOUCH, L"Keep mouse off touchscreen");
             AppendMenuW(m, MF_STRING | (StartupEnabled()? MF_CHECKED : 0), IDM_STARTUP, L"Run at startup");
             AppendMenuW(m, MF_STRING, IDM_HOME, L"Return cursor home\tCtrl+Alt+Home");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -699,6 +725,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                           SaveBoolSetting(L"RestoreFocus", g_restoreFocus); break;
         case IDM_STARTUP: SetStartup(!StartupEnabled()); break;
         case IDM_HOME:    ReturnCursorHome(); break;
+        case IDM_KEEP_OFF_TOUCH:
+            g_keepMouseOffTouch = !g_keepMouseOffTouch;
+            SaveBoolSetting(L"KeepMouseOffTouch", g_keepMouseOffTouch);
+            if (g_keepMouseOffTouch) ReturnCursorHome();
+            break;
         case IDM_EXIT:    DestroyWindow(hwnd); break;
         }
         return 0;
@@ -728,6 +759,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
     }
 
     LoadSettings();
+    LogF("settings: enabled=%d restoreFocus=%d keepMouseOffTouch=%d",
+         g_enabled, g_restoreFocus, g_keepMouseOffTouch);
 
     // Per-Monitor-V2 DPI awareness: the LL-hook coords and SetCursorPos then share
     // one physical-pixel space on mixed-DPI monitor setups (no-op before Win10 1703).

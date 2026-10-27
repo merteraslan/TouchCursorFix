@@ -24,3 +24,6 @@ Log path cases cover a short executable name whose longer log name crosses
 Touch cases cover a three-monitor edge, touch immediately after mouse motion,
 out-of-order raw-input timestamps, return without a raw digitizer event, genuine
 physical mouse entry, and hotkey/tray recovery without stealing keyboard focus.
+Isolated-touchscreen cases cover recovery on resumed mouse motion, stale
+ownership during a return, unaffected non-touch monitors, disabled behavior,
+opt-out compatibility, preference persistence, and preservation of keyboard focus.

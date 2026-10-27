@@ -39,13 +39,15 @@ Right-click the tray icon:
 |---|---|
 | **Enabled** | master toggle (remembered between runs) |
 | **Restore window focus** | give focus back to the pre-touch window after a tap (remembered between runs) |
+| **Keep mouse off touchscreen** | recover automatically when mouse movement resumes on a stranded touch display (remembered; off by default) |
 | **Run at startup** | auto-start at login (HKCU `Run` key — no admin, no scheduled task) |
 | **Return cursor home** | return the cursor to its last non-touch position without changing keyboard focus; shortcut **Ctrl+Alt+Home** |
 | **Exit** | quit |
 
-Preferences are stored as DWORD values `Enabled` and `RestoreFocus` under
-`HKEY_CURRENT_USER\Software\TouchCursorFix`. Both default to enabled on a fresh
-installation. Turn off **Restore window focus** to keep typing in a text field
+Preferences are stored as DWORD values `Enabled`, `RestoreFocus`, and
+`KeepMouseOffTouch` under `HKEY_CURRENT_USER\Software\TouchCursorFix`.
+`Enabled` and `RestoreFocus` default to enabled on a fresh installation;
+`KeepMouseOffTouch` defaults to disabled. Turn off **Restore window focus** to keep typing in a text field
 you touched on the touchscreen while still returning the mouse cursor home.
 **Run at startup** remains a separate, opt-in setting.
 Disabling the tool cancels pending cursor/focus corrections immediately;
@@ -56,13 +58,21 @@ longer on an available non-touch monitor, recovery uses a non-touch monitor's
 center (preferring the primary display). If another app already owns the
 shortcut, tray recovery is still available.
 
+For a touchscreen that you intentionally keep separate from mouse navigation,
+enable **Keep mouse off touchscreen**. Physical mouse motion on that display
+then returns the cursor to its previous non-touch position immediately, without
+waiting for a correction timer or changing keyboard focus. Mouse movement no
+longer cancels an in-progress touch return in this mode. Normal monitors and
+Windows' display layout are unchanged. Disable this option if you want to use
+the mouse directly on the touchscreen monitor.
+
 ## How it works
 
 1. Windows reports which monitor belongs to the touch digitizer (`GetPointerDevices`) — that's *touch land*; everywhere else is *home*
 2. A `WH_MOUSE_LL` hook records cursor positions and tracks your last *home* position
 3. Touches are detected using Windows' pen/touch mouse-event signature and raw digitizer input, with cursor-jump inference as a fallback when the target swallows raw input
 4. Once the touch settles: the pre-touch window gets focus back first (VMs/games release cursor grabs when they lose it), then the cursor snaps home — retrying until it sticks
-5. Move the mouse onto the touch monitor yourself and the tool **stands down** until you leave. An explicit pen/touch event is never treated as physical mouse motion just because the mouse moved recently.
+5. Unless **Keep mouse off touchscreen** is enabled, moving the mouse onto the touch monitor makes the tool stand down until you leave. An explicit pen/touch event is never treated as physical mouse motion just because the mouse moved recently.
 
 <details>
 <summary><b>Implementation notes</b> (for the curious)</summary>

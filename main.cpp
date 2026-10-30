@@ -553,6 +553,24 @@ static BOOL StartupEnabled() {
     }
     return on;
 }
+
+// A logon task may launch this mode after Explorer's normal Run processing.
+// Respect the same tray preference, including when that task still exists
+// after the user unchecks Run at startup. Manual launches remain unaffected.
+static BOOL StartupLaunchAllowed(const wchar_t* arguments) {
+    if (!arguments || !*arguments) return TRUE;
+    std::wstring command = L"TouchCursorFix.exe ";
+    command += arguments;
+    int count = 0;
+    LPWSTR* args = CommandLineToArgvW(command.c_str(), &count);
+    if (!args) return FALSE;
+    BOOL startup = FALSE;
+    for (int i = 1; i < count; ++i)
+        if (lstrcmpiW(args[i], L"-startup") == 0) startup = TRUE;
+    LocalFree(args);
+    return !startup || StartupEnabled();
+}
+
 static void SetStartup(BOOL on) {
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
@@ -747,6 +765,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmd, int) {
     g_hInst = hInst;
+    if (!StartupLaunchAllowed(cmd)) return 0;
 
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"TouchCursorFix_singleton_v1");
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) return 0;

@@ -352,6 +352,26 @@ static void TestTouchReturnClassification() {
     g_touchMonCount = 0;
 }
 
+static void TestStartupLaunchPreference() {
+    Check(StartupLaunchAllowed(nullptr) && StartupLaunchAllowed(L"-log"),
+          "manual launches work without startup preference");
+    Check(!StartupLaunchAllowed(L"-startup") && !StartupLaunchAllowed(L"-startup -log"),
+          "logon launches stop when startup is disabled");
+    HKEY run;
+    Check(RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, nullptr, 0,
+                          KEY_ALL_ACCESS, nullptr, &run, nullptr) == ERROR_SUCCESS,
+          "create isolated startup key");
+    RegCloseKey(run);
+    SetStartup(TRUE);
+    Check(StartupEnabled() && StartupLaunchAllowed(L"-startup"),
+          "enabling the tray startup preference permits the logon task");
+    SetStartup(FALSE);
+    Check(!StartupEnabled() && !StartupLaunchAllowed(L"-startup -log"),
+          "disabling the tray startup preference also blocks the logon task");
+    Check(StartupLaunchAllowed(L"-log -startup-other"),
+          "startup mode matches an entire argument");
+}
+
 int main() {
     wchar_t keyPath[128];
     swprintf(keyPath, 128, L"Software\\TouchCursorFixRegression_%lu", GetCurrentProcessId());
@@ -368,6 +388,7 @@ int main() {
     TestDisableCancelsQueuedWork();
     TestLogPath();
     TestTouchReturnClassification();
+    TestStartupLaunchPreference();
 
     Check(RegOverridePredefKey(HKEY_CURRENT_USER, nullptr) == ERROR_SUCCESS,
           "restore registry mapping");
@@ -375,6 +396,6 @@ int main() {
     isolatedRegistryRoot = nullptr;
     Check(RegDeleteTreeW(HKEY_CURRENT_USER, keyPath) == ERROR_SUCCESS,
           "remove temporary test registry data");
-    puts("PASS: preferences, disabled input state, log paths, touch classification, recovery");
+    puts("PASS: preferences, disabled input state, log paths, touch classification, recovery, startup");
     return 0;
 }

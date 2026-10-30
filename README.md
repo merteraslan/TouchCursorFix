@@ -50,6 +50,11 @@ Preferences are stored as DWORD values `Enabled`, `RestoreFocus`, and
 `KeepMouseOffTouch` defaults to disabled. Turn off **Restore window focus** to keep typing in a text field
 you touched on the touchscreen while still returning the mouse cursor home.
 **Run at startup** remains a separate, opt-in setting.
+The `-startup` argument is intended for an optional delayed Windows logon task:
+the app exits immediately if **Run at startup** has been unchecked. This keeps
+the tray preference in control of both launch methods. A logon task should run
+as the logged-in user, with limited privileges and no execution time limit.
+The application does not create a scheduled task automatically.
 Disabling the tool cancels pending cursor/focus corrections immediately;
 re-enabling starts tracking from the current cursor and foreground window.
 If an isolated touchscreen leaves the cursor stranded, press **Ctrl+Alt+Home**

@@ -27,3 +27,5 @@ physical mouse entry, and hotkey/tray recovery without stealing keyboard focus.
 Isolated-touchscreen cases cover recovery on resumed mouse motion, stale
 ownership during a return, unaffected non-touch monitors, disabled behavior,
 opt-out compatibility, preference persistence, and preservation of keyboard focus.
+Startup cases verify that a delayed `-startup` launch honors the existing tray
+preference, including after it is disabled; manual launches remain available.
